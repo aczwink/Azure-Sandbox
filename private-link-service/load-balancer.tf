@@ -1,18 +1,25 @@
 resource "azurerm_lb" "lb" {
     location = var.location
-    name = "sbx-lbe-${local.appName}"
+    name = "sbx-lbe-${local.appName}-pls"
     resource_group_name = azurerm_resource_group.rg.name
 
     frontend_ip_configuration {
-        name = "PublicIPAddress"
-        public_ip_address_id = azurerm_public_ip.pip.id
+        name = "pls-frontend"
+
+        subnet_id = azurerm_subnet.plsSubnet.id
     }
 }
 
 resource "azurerm_lb_backend_address_pool" "pool" {
-    name = "vmss-pool"
+    name = "pls-pool"
 
     loadbalancer_id = azurerm_lb.lb.id
+}
+
+resource "azurerm_network_interface_backend_address_pool_association" "providerPoolAssociation" {
+    backend_address_pool_id = azurerm_lb_backend_address_pool.pool.id
+    ip_configuration_name = "internal"
+    network_interface_id = azurerm_network_interface.providerNIC.id
 }
 
 resource "azurerm_lb_probe" "probe" {

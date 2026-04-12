@@ -1,0 +1,1 @@
+This will deploy an Azure Storage Account with private endpoint and public IP disabled. It also deploys a Windows VM with public IP into the same VNet as the private endpoint. Visiting the portal and going into the container will work from within the VM but not from outside (i.e. Internet).
