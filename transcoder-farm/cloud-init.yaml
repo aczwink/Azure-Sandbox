@@ -1,0 +1,266 @@
+#cloud-config
+
+package_update: true
+
+packages:
+  - ffmpeg
+  - python3
+  - python3-pip
+  - python3-venv
+  - jq
+
+write_files:
+  - path: /opt/transcoder/requirements.txt
+    permissions: "0644"
+    content: |
+      azure-identity
+      azure-storage-blob
+      
+  - path: /opt/transcoder/worker.py
+    permissions: "0755"
+    content: |
+      import os
+      import subprocess
+      import time
+      from pathlib import Path
+
+      from azure.identity import ManagedIdentityCredential
+      from azure.storage.blob import BlobServiceClient
+
+      STORAGE_ACCOUNT = os.environ["STORAGE_ACCOUNT"]
+
+      WORK_DIR = Path("/transcode")
+      INPUT_DIR = WORK_DIR / "input"
+      OUTPUT_DIR = WORK_DIR / "output"
+
+      credential = ManagedIdentityCredential()
+
+      service = BlobServiceClient(
+          account_url=f"https://{STORAGE_ACCOUNT}.blob.core.windows.net",
+          credential=credential
+      )
+
+      CONTAINERS = [
+          "input-h264",
+          "input-h265"
+      ]
+      
+      def transcode(input_file, codec, crf):
+        output_file = OUTPUT_DIR / f"{input_file.stem}.mkv"
+        
+        print(
+          f"Transcoding {input_file.name} using {codec}",
+          flush=True
+        )
+        
+        subprocess.run(
+          [
+            "ffmpeg",
+            "-y",
+            "-i", str(input_file),
+            "-map", "0",
+            "-c:v", codec,
+            "-preset", "medium",
+            "-crf", crf,
+            "-c:a", "copy",
+            "-c:s", "copy",
+            "-c:t", "copy",
+            str(output_file)
+          ],
+          check=True
+        )
+        
+        print(
+          f"Created {output_file}",
+          flush=True
+        )
+        
+        return output_file
+
+
+      def download_blob(container_name, blob_name):
+          local_file = INPUT_DIR / blob_name
+
+          local_file.parent.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          if local_file.exists():
+              print(
+                  f"Already downloaded: {blob_name}",
+                  flush=True
+              )
+              return local_file
+
+          print(
+              f"Downloading {container_name}/{blob_name}",
+              flush=True
+          )
+
+          blob_client = service.get_blob_client(
+              container=container_name,
+              blob=blob_name
+          )
+              
+          with open(local_file, "wb") as file_handle:
+            stream = blob_client.download_blob()
+            stream.readinto(file_handle)
+
+          size_mb = local_file.stat().st_size / 1024 / 1024
+
+          print(
+              f"Downloaded {blob_name} ({size_mb:.2f} MB)",
+              flush=True
+          )
+
+          return local_file
+
+      def upload_blob(local_file):
+        blob_name = local_file.name
+
+        print(
+            f"Uploading {blob_name}",
+            flush=True
+        )
+
+        blob_client = service.get_blob_client(
+            container="output",
+            blob=blob_name
+        )
+
+        with open(local_file, "rb") as handle:
+            blob_client.upload_blob(
+                handle,
+                overwrite=True
+            )
+
+        print(
+            f"Uploaded {blob_name}",
+            flush=True
+        )
+
+
+      while True:
+          try:
+
+              processed = False
+
+              for container_name in CONTAINERS:
+
+                  container = service.get_container_client(
+                      container_name
+                  )
+
+                  blobs = list(container.list_blobs())
+
+                  print(
+                      f"{container_name}: {len(blobs)} blobs",
+                      flush=True
+                  )
+
+                  if not blobs:
+                      continue
+
+                  blob = blobs[0]
+
+                  input_file = download_blob(
+                      container_name,
+                      blob.name
+                  )
+                  
+                  codec = (
+                    "libx264"
+                    if container_name == "input-h264"
+                    else "libx265"
+                  )
+                  crf = (
+                    "17"
+                    if container_name == "input-h264"
+                    else "22"
+                  )
+                  
+                  output_file = transcode(input_file, codec, crf)
+                  
+                  upload_blob(output_file)
+                  
+                  service.get_blob_client(
+                    container=container_name,
+                    blob=blob.name
+                  ).delete_blob()
+                  
+                  print(
+                    f"Deleted input blob {blob.name}",
+                    flush=True
+                  )
+                  input_file.unlink(missing_ok=True)
+                  output_file.unlink(missing_ok=True)
+
+                  processed = True
+                  break
+
+              if not processed:
+                  print(
+                      "No work found",
+                      flush=True
+                  )
+
+          except Exception as ex:
+              print(
+                  f"ERROR: {ex}",
+                  flush=True
+              )
+
+          time.sleep(30)
+
+  - path: /etc/systemd/system/transcoder.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Video Transcoder Worker
+      After=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart=/opt/transcoder/venv/bin/python /opt/transcoder/worker.py
+      Restart=always
+      RestartSec=10
+      Environment=STORAGE_ACCOUNT=${storage_account_name}
+
+      [Install]
+      WantedBy=multi-user.target
+      
+runcmd:
+  - |
+      for i in $(seq 1 30); do
+        if [ -b /dev/disk/azure/scsi1/lun0 ]; then
+          break
+        fi
+        sleep 2
+      done
+  - |
+      if ! blkid /dev/disk/azure/scsi1/lun0; then
+        mkfs.ext4 -F /dev/disk/azure/scsi1/lun0
+      fi
+
+  - mkdir -p /transcode
+
+  - |
+      UUID=$(blkid -s UUID -o value /dev/disk/azure/scsi1/lun0)
+
+      grep -q "$UUID" /etc/fstab || \
+      echo "UUID=$UUID /transcode ext4 defaults,nofail 0 2" >> /etc/fstab
+
+  - mount -a
+
+  - mkdir -p /transcode/input
+  - mkdir -p /transcode/output
+
+  - python3 -m venv /opt/transcoder/venv
+
+  - /opt/transcoder/venv/bin/pip install --upgrade pip
+  - /opt/transcoder/venv/bin/pip install -r /opt/transcoder/requirements.txt
+
+  - systemctl daemon-reload
+  - systemctl enable transcoder
+  - systemctl start transcoder
